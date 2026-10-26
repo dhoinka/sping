@@ -3,7 +3,8 @@
 ## Project
 
 sping is a small Go CLI that displays live ping latency and packet loss in a
-single-line terminal chart. See [README.md](./README.md) for usage.
+two-line terminal display: statistics above a full-width running chart.
+See [README.md](./README.md) for usage.
 
 - [go.mod](./go.mod) defines the required Go version.
 - [cmd/sping/](./cmd/sping/) contains the CLI and its tests.

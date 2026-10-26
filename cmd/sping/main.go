@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type sample struct {
@@ -53,9 +55,17 @@ func paint(s, color string, enabled bool) string {
 }
 
 func (t *tracker) line(width int, scale time.Duration, color bool) string {
+	return fmt.Sprintf("[%s] %s", t.chart(width, scale, color), t.status(color))
+}
+
+func (t *tracker) chart(width int, scale time.Duration, color bool) string {
 	var chart strings.Builder
 	bars := []rune("▁▂▃▄▅▆▇█")
-	for _, s := range t.history {
+	history := t.history
+	if len(history) > width {
+		history = history[len(history)-width:]
+	}
+	for _, s := range history {
 		if s.err != "" {
 			chart.WriteString(paint("█", "1;31", color))
 			continue
@@ -72,8 +82,15 @@ func (t *tracker) line(width int, scale time.Duration, color bool) string {
 		}
 		chart.WriteString(paint(string(bars[level]), shade, color))
 	}
-	for i := len(t.history); i < width; i++ {
+	for i := len(history); i < width; i++ {
 		chart.WriteString("·")
+	}
+	return chart.String()
+}
+
+func (t *tracker) status(color bool) string {
+	if len(t.history) == 0 {
+		return "Waiting for first reply… | avg — | p95 — | loss —"
 	}
 	last := t.history[len(t.history)-1]
 	status := paint(fmt.Sprintf("%.1f ms", float64(last.rtt)/float64(time.Millisecond)), "32", color)
@@ -93,7 +110,7 @@ func (t *tracker) line(width int, scale time.Duration, color bool) string {
 	if lost > 0 {
 		loss = paint(loss, "1;31", color)
 	}
-	return fmt.Sprintf("[%s] %s | avg %s | p95 %s | %s", chart.String(), status, avg, p95, loss)
+	return fmt.Sprintf("%s | avg %s | p95 %s | %s", status, avg, p95, loss)
 }
 
 var latencyPattern = regexp.MustCompile(`(?i)time[=<]\s*([0-9]+(?:\.[0-9]+)?)\s*ms`)
@@ -148,7 +165,7 @@ func run(ctx context.Context, args []string, out, errOut io.Writer, interactive 
 	flags.SetOutput(errOut)
 	interval := flags.Duration("interval", time.Second, "time between ping starts")
 	timeout := flags.Duration("timeout", time.Second, "maximum wait for each reply")
-	width := flags.Int("width", 40, "number of recent pings to display (1–200)")
+	width := flags.Int("width", 0, "chart history limit (0 = terminal width; redirected output uses 40)")
 	scale := flags.Duration("scale", 200*time.Millisecond, "latency represented by a full-height bar")
 	count := flags.Int("count", 0, "stop after this many pings (0 = continuous)")
 	noColor := flags.Bool("no-color", false, "disable ANSI colors")
@@ -159,8 +176,8 @@ func run(ctx context.Context, args []string, out, errOut io.Writer, interactive 
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *interval <= 0 || *timeout <= 0 || *scale <= 0 || *width < 1 || *width > 200 || *count < 0 {
-		return errors.New("interval, timeout and scale must be positive; width must be 1–200; count must be nonnegative")
+	if *interval <= 0 || *timeout <= 0 || *scale <= 0 || *width < 0 || *count < 0 {
+		return errors.New("interval, timeout and scale must be positive; width and count must be nonnegative")
 	}
 	host := "1.1.1.1"
 	if flags.NArg() > 1 {
@@ -178,33 +195,74 @@ func run(ctx context.Context, args []string, out, errOut io.Writer, interactive 
 	}
 	_, noColorEnv := os.LookupEnv("NO_COLOR")
 	color := interactive && !*noColor && !noColorEnv && os.Getenv("TERM") != "dumb"
-	fmt.Fprintf(out, "sping → %s | ▁ low → █ %s+\n", host, *scale)
-	if interactive {
-		fmt.Fprint(out, "Waiting for first reply…")
-		defer fmt.Fprintln(out)
-	}
 	t := tracker{}
+	if interactive {
+		// Reserve two lines in the normal terminal; leave prior output visible.
+		fmt.Fprint(out, "\x1b[?25l\n")
+		defer func() {
+			fmt.Fprint(out, "\x1b[0m\x1b[?25h\n")
+		}()
+		drawScreen(out, &t, host, *width, *scale, color)
+	} else {
+		fmt.Fprintf(out, "sping → %s\n", host)
+	}
+	// Run probes separately so the screen can respond to resizing while waiting.
+	results := make(chan sample)
+	probeCtx, stopProbes := context.WithCancel(ctx)
+	defer stopProbes()
+	go func() {
+		for probeCtx.Err() == nil {
+			started := time.Now()
+			s := probe(probeCtx, binary, host, *timeout)
+			select {
+			case results <- s:
+			case <-probeCtx.Done():
+				return
+			}
+			timer := time.NewTimer(max(0, *interval-time.Since(started)))
+			select {
+			case <-probeCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}()
+	resize := time.NewTicker(200 * time.Millisecond)
+	defer resize.Stop()
+	lastWidth, lastHeight := terminalSize(out)
 	for ctx.Err() == nil {
-		started := time.Now()
-		s := probe(ctx, binary, host, *timeout)
-		if ctx.Err() != nil {
-			break
-		}
-		t.add(s, *width)
-		line := t.line(*width, *scale, color)
-		if interactive {
-			fmt.Fprintf(out, "\r\x1b[2K%s", line)
-		} else {
-			fmt.Fprintln(out, line)
-		}
-		if *count > 0 && t.sent >= *count {
-			break
-		}
-		timer := time.NewTimer(max(0, *interval-time.Since(started)))
 		select {
 		case <-ctx.Done():
-			timer.Stop()
-		case <-timer.C:
+			return nil
+		case <-resize.C:
+			if interactive {
+				w, h := terminalSize(out)
+				if w != lastWidth || h != lastHeight {
+					lastWidth, lastHeight = w, h
+					drawScreen(out, &t, host, *width, *scale, color)
+				}
+			}
+		case s := <-results:
+			if ctx.Err() != nil {
+				return nil
+			}
+			historyWidth := *width
+			if historyWidth == 0 {
+				historyWidth = 40
+				if interactive {
+					historyWidth, _ = terminalSize(out)
+				}
+			}
+			t.add(s, historyWidth)
+			if interactive {
+				drawScreen(out, &t, host, *width, *scale, color)
+			} else {
+				fmt.Fprintln(out, t.line(historyWidth, *scale, false))
+			}
+			if *count > 0 && t.sent >= *count {
+				return nil
+			}
 		}
 	}
 	return nil
@@ -213,8 +271,7 @@ func run(ctx context.Context, args []string, out, errOut io.Writer, interactive 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	info, err := os.Stdout.Stat()
-	interactive := err == nil && info.Mode()&os.ModeCharDevice != 0 && os.Getenv("TERM") != "dumb"
+	interactive := term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("TERM") != "dumb"
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr, interactive); err != nil && !errors.Is(err, flag.ErrHelp) {
 		fmt.Fprintln(os.Stderr, "sping:", err)
 		os.Exit(1)
