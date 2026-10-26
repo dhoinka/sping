@@ -41,3 +41,7 @@ Build and test:
 go build -o sping ./cmd/sping
 go test ./...
 ```
+
+## License
+
+Licensed under the [MIT License](./LICENSE).
