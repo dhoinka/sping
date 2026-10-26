@@ -1,0 +1,13 @@
+# Build and test output
+/sping
+/sping.exe
+*.test
+*.test.exe
+/coverage.out
+/coverage/
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
